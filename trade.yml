@@ -1,0 +1,37 @@
+name: trade
+on:
+  schedule:
+    - cron: "20 13 * * 1-5"   # 13:20 UTC; der Bot wartet selbst bis zur Börsenöffnung (Sommer- und Winterzeit)
+  workflow_dispatch:
+concurrency:
+  group: trading
+  cancel-in-progress: false
+jobs:
+  part1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas numpy alpaca-py yfinance
+      - run: python nasdaq_daytrader.py run --until 330
+        env:
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+  part2:
+    needs: part1
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas numpy alpaca-py yfinance
+      - run: python nasdaq_daytrader.py run
+        env:
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
