@@ -1,7 +1,8 @@
 """Nasdaq Day-Trading-Bot (Paper). Ersetzt nasdaq_bot.py.
 
-  python nasdaq_daytrader.py research  -> lädt 15-Minuten-Kurse 2016-2026, testet Strategien,
-                                          Zufallstest, speichert die Top-Gewinner
+  python nasdaq_daytrader.py research  -> Daytrading-Analyse (15-Minuten-Kurse 2016-2026) und danach
+                                          Tagesbasis-Analyse (2010-2026), jeweils mit Zufallstest
+  python nasdaq_daytrader.py research-daily -> nur die Tagesbasis-Analyse
   python nasdaq_daytrader.py run       -> handelt die Gewinner automatisch im Alpaca-PAPER-Konto
                                           (Option --until MINUTEN beendet den Lauf nach dieser Zeit)
 
@@ -195,6 +196,107 @@ def research(days=None):
     return passed
 
 
+# ---------- Tagesbasis-Analyse (2010-2026, swing statt Daytrading) ----------
+SPLIT_D = date(2020, 1, 1)    # davor: Parameter wählen, danach: ungesehen prüfen
+COST_D = 0.0005               # 0,05 % pro Positionswechsel (Gebühren und Kursabweichung)
+RESULT_D = "passed_daily.json"
+
+
+def sharpe(x):
+    sd = x.std()
+    return 0.0 if sd == 0 else float(np.sqrt(252) * x.mean() / sd)
+
+
+def load_daily():
+    syms = UNIVERSE + ["QQQ"]
+    try:
+        import yfinance as yf
+        df = yf.download(syms, start="2010-01-01", auto_adjust=True, progress=False)
+        close = df["Close"].dropna(how="all")
+        if len(close) > 1000:
+            print(f"Tageskurse von Yahoo: {len(close)} Tage, {close.shape[1]} Werte", flush=True)
+            return close
+        print("Yahoo lieferte zu wenig Daten, wechsle zu Alpaca (ab 2016)", flush=True)
+    except Exception as e:
+        print("Yahoo nicht erreichbar:", e, "-> wechsle zu Alpaca (ab 2016)", flush=True)
+    from alpaca.data.enums import Adjustment, DataFeed
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    bars = _clients().get_stock_bars(StockBarsRequest(
+        symbol_or_symbols=syms, timeframe=TimeFrame.Day, start=START,
+        feed=DataFeed.IEX, adjustment=Adjustment.ALL)).df
+    close = bars["close"].unstack(level=0)
+    close.index = close.index.tz_convert(None).normalize()
+    print(f"Tageskurse von Alpaca: {len(close)} Tage, {close.shape[1]} Werte", flush=True)
+    return close
+
+
+def _hold_df(c, on, off):
+    pos = pd.DataFrame(np.nan, index=c.index, columns=c.columns)
+    pos[on] = 1
+    pos[off] = 0
+    return pos.ffill().fillna(0) > 0
+
+
+def daily_pos(c, kind, p):
+    if kind == "sma_cross":
+        return c.rolling(p[0]).mean() > c.rolling(p[1]).mean()
+    if kind == "momentum":
+        return c.pct_change(p[0]) > 0
+    if kind == "breakout":
+        hi = c.rolling(p[0]).max().shift(1)
+        lo = c.rolling(max(p[0] // 2, 2)).min().shift(1)
+        return _hold_df(c, c > hi, c < lo)
+    d = c.diff()                                  # rsi_trend: Rücksetzer im Aufwärtstrend
+    up = d.clip(lower=0).ewm(alpha=1 / p[0]).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / p[0]).mean()
+    rsi = 100 - 100 / (1 + up / dn)
+    return _hold_df(c, (rsi < p[1]) & (c > c.rolling(200).mean()), rsi > 60)
+
+
+DAILY = {
+    "sma_cross": [(f, s) for f in (10, 20, 50) for s in (100, 150, 200)],
+    "momentum": [(n,) for n in (20, 60, 120, 250)],
+    "breakout": [(n,) for n in (20, 50, 100)],
+    "rsi_trend": [(n, l) for n in (2, 5) for l in (5, 10, 20)],
+}
+
+
+def _dret(P, R):
+    net = P * R - np.abs(np.diff(P, axis=0, prepend=np.zeros((1, P.shape[1])))) * COST_D
+    return net.mean(axis=1)          # gleich gewichtet über alle Aktien, Cash wenn nicht investiert
+
+
+def research_daily(c=None, n_random=500):
+    c = load_daily() if c is None else c
+    rng = np.random.default_rng(7)
+    R = c.pct_change().fillna(0).values
+    ins = np.array([d.date() < SPLIT_D for d in c.index])
+    bh = sharpe(R[~ins].mean(axis=1))
+    print(f"\nTAGESBASIS: {c.shape[1]} Werte, Prüfzeitraum ab {SPLIT_D}, Buy & Hold Sharpe {bh:.2f}\n")
+    passed = []
+    for name, grid in DAILY.items():
+        pos = {g: np.vstack([np.zeros((1, c.shape[1])), daily_pos(c, name, g).values[:-1].astype(float)])
+               for g in grid}                       # Signal von gestern, Einstieg heute
+        best = max(grid, key=lambda g: sharpe(_dret(pos[g][ins], R[ins])))
+        s_in = sharpe(_dret(pos[best][ins], R[ins]))
+        Pr, Rr = pos[best][~ins], R[~ins]
+        s_out = sharpe(_dret(Pr, Rr))
+        n = len(Pr)
+        rand = np.array([sharpe(_dret(np.roll(Pr, int(rng.integers(20, n - 20)), axis=0), Rr))
+                         for _ in range(n_random)])
+        p = float((rand >= s_out).mean())
+        invested = float(Pr.mean())
+        ok = p < P_MAX and s_out > 0
+        print(f"{name:10s} Parameter {best}  Sharpe vorher {s_in:5.2f}  Prüfung {s_out:5.2f}  "
+              f"investiert {invested:.0%}  p={p:.4f}  -> {'BESTANDEN' if ok else 'aussortiert'}")
+        if ok:
+            passed.append({"name": name, "params": list(best), "oos_sharpe": s_out, "p": p, "bh_sharpe": bh})
+    json.dump(sorted(passed, key=lambda x: -x["oos_sharpe"])[:TOP_N], open(RESULT_D, "w"), indent=2)
+    print(f"\n{len(passed)} Tagesstrategie(n) gespeichert in {RESULT_D}")
+    return passed
+
+
 # ---------- Live (Alpaca Paper) ----------
 def _frame(g, prev):
     return SimpleNamespace(o=g["open"].values, h=g["high"].values, l=g["low"].values,
@@ -336,6 +438,9 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "research":
         research()
+        research_daily()
+    elif cmd == "research-daily":
+        research_daily()
     elif cmd == "run":
         until = int(sys.argv[sys.argv.index("--until") + 1]) if "--until" in sys.argv else None
         run(until)
