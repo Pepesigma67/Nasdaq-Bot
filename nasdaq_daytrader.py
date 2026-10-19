@@ -1,7 +1,7 @@
 """Nasdaq Day-Trading-Bot (Paper). Ersetzt nasdaq_bot.py.
 
   python nasdaq_daytrader.py research  -> Daytrading-Analyse (15-Minuten-Kurse 2016-2026) und danach
-                                          Tagesbasis-Analyse (2010-2026), jeweils mit Zufallstest
+                                          Tagesbasis- und Rotations-Analyse (2010-2026), jeweils mit Zufallstest
   python nasdaq_daytrader.py research-daily -> nur die Tagesbasis-Analyse
   python nasdaq_daytrader.py run       -> handelt die Gewinner automatisch im Alpaca-PAPER-Konto
                                           (Option --until MINUTEN beendet den Lauf nach dieser Zeit)
@@ -297,6 +297,62 @@ def research_daily(c=None, n_random=500):
     return passed
 
 
+# ---------- Rotation: jeden Monat die stärksten Aktien halten ----------
+RESULT_R = "passed_rotation.json"
+N_FAMILIES = 8                # bisher getestete Ideen insgesamt (3 Daytrading, 4 Tagesbasis, 1 Rotation)
+P_ROT = 0.05 / N_FAMILIES     # strengere Schwelle, weil jede weitere Idee die Zufallsgefahr erhöht
+
+
+def build_weights(c, n, k, filt, rng=None):
+    """Alle 21 Handelstage: die k Aktien mit der besten Rendite der letzten n Tage (mit rng: k zufällige
+    Aktien). Mit filt nur investiert, wenn QQQ über seinem 200-Tage-Durchschnitt liegt."""
+    st = [x for x in c.columns if x != "QQQ"]
+    ret = c[st].pct_change(n).values
+    ok = (c["QQQ"] > c["QQQ"].rolling(200).mean()).values if filt else np.ones(len(c), bool)
+    W = np.zeros((len(c), len(st)))
+    cur = np.zeros(len(st))
+    for t in range(max(n, 200), len(c)):
+        if (t - max(n, 200)) % 21 == 0:
+            cur = np.zeros(len(st))
+            r = ret[t]
+            avail = np.where(~np.isnan(r))[0]
+            if ok[t] and len(avail) >= k:
+                pick = avail[np.argsort(-r[avail])[:k]] if rng is None else rng.choice(avail, k, replace=False)
+                cur[pick] = 1.0 / k
+        W[t] = cur
+    return W
+
+
+def _rret(W, Rs):
+    P = np.vstack([np.zeros((1, W.shape[1])), W[:-1]])        # Signal von gestern, Einstieg heute
+    return (P * Rs).sum(axis=1) - np.abs(np.diff(P, axis=0, prepend=np.zeros((1, P.shape[1])))).sum(axis=1) * COST_D
+
+
+def research_rotation(c=None, n_random=1000):
+    c = load_daily() if c is None else c
+    rng = np.random.default_rng(11)
+    st = [x for x in c.columns if x != "QQQ"]
+    Rs = c[st].pct_change().fillna(0).values
+    ins = np.array([d.date() < SPLIT_D for d in c.index])
+    bh = sharpe(Rs[~ins].mean(axis=1))
+    grid = [(n, k, f) for n in (60, 120, 250) for k in (3, 5, 10) for f in (False, True)]
+    W = {g: build_weights(c, *g) for g in grid}
+    best = max(grid, key=lambda g: sharpe(_rret(W[g], Rs)[ins]))
+    s_in = sharpe(_rret(W[best], Rs)[ins])
+    s_out = sharpe(_rret(W[best], Rs)[~ins])
+    rand = np.array([sharpe(_rret(build_weights(c, *best, rng=rng), Rs)[~ins]) for _ in range(n_random)])
+    p = float((rand >= s_out).mean())
+    ok = p < P_ROT and s_out > 0
+    print(f"\nROTATION: Prüfzeitraum ab {SPLIT_D}, Buy & Hold Sharpe {bh:.2f}, zufällige Aktienwahl im Schnitt {rand.mean():.2f}")
+    print(f"rotation  Parameter (Rückblick {best[0]}, Anzahl {best[1]}, Marktfilter {best[2]})  "
+          f"Sharpe vorher {s_in:5.2f}  Prüfung {s_out:5.2f}  p={p:.4f} (Schwelle {P_ROT:.4f})  -> "
+          f"{'BESTANDEN' if ok else 'aussortiert'}")
+    res = [{"name": "rotation", "params": list(best), "oos_sharpe": s_out, "p": p, "bh_sharpe": bh}] if ok else []
+    json.dump(res, open(RESULT_R, "w"), indent=2)
+    print(f"{len(res)} Rotationsstrategie(n) gespeichert in {RESULT_R}")
+    return res
+
+
 # ---------- Live (Alpaca Paper) ----------
 def _frame(g, prev):
     return SimpleNamespace(o=g["open"].values, h=g["high"].values, l=g["low"].values,
@@ -438,9 +494,13 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "research":
         research()
-        research_daily()
+        data = load_daily()
+        research_daily(data)
+        research_rotation(data)
     elif cmd == "research-daily":
-        research_daily()
+        data = load_daily()
+        research_daily(data)
+        research_rotation(data)
     elif cmd == "run":
         until = int(sys.argv[sys.argv.index("--until") + 1]) if "--until" in sys.argv else None
         run(until)
